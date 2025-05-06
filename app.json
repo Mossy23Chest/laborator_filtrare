@@ -1,7 +1,7 @@
 {
   "expo": {
-    "name": "laborator_achizitie_si_redare",
-    "slug": "laborator_achizitie_si_redare",
+    "name": "laborator_spectrograma",
+    "slug": "laborator_spectrograma",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
@@ -15,7 +15,8 @@
       "adaptiveIcon": {
         "foregroundImage": "./assets/images/adaptive-icon.png",
         "backgroundColor": "#ffffff"
-      }
+      },
+      "package": "com.mossychest.laborator_spectrograma"
     },
     "web": {
       "bundler": "metro",
