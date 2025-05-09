@@ -214,14 +214,14 @@ const RecordListItem: React.FC<RecordListItemProps> = ({
       
       // Add onComplete parameter to reset the generating state when navigating back
       paramsForScreen.onComplete = 'true';
-      
-      router.push({
+    
+    router.push({
         pathname: '/(tabs)/spectogramScreen', // Target screen route
-        params: { 
+      params: { 
           ...paramsForScreen, // Includes either rawSamples OR audioMetering string
           initialOptions: JSON.stringify(optionsToUse) // Pass initial options string
-        },
-      });
+      },
+    });
     } catch (error) {
         console.error("Error during audio processing or navigation setup:", error);
         Alert.alert('Navigation Error', 'Could not prepare data for spectrogram screen.');

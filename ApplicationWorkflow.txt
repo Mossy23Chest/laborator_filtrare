@@ -1,0 +1,187 @@
+# Application Workflow Documentation
+
+This document outlines the data flow and component interactions within the audio recording and spectrogram analysis application.
+
+## Core Components:
+
+1.  **`app/(tabs)/index.tsx` (Main Screen):**
+    *   Manages the list of recordings (`recordList` state).
+    *   Handles audio recording using `react-native-audio-record`.
+    *   Handles audio file import using `expo-document-picker`.
+    *   Handles sine wave generation.
+    *   Provides playback controls (using `expo-av` indirectly via `RecordListItem`).
+    *   Renders the list of recordings using `FlatList` and the `RecordListItem` component.
+
+2.  **`components/sunet/recordListItem.tsx` (List Item):**
+    *   Represents a single recording in the list.
+    *   Loads the audio file using `expo-av` for playback status and duration.
+    *   Handles playback control (play/pause) for its specific sound.
+    *   Provides buttons to navigate to the spectrogram screen and download the audio file.
+    *   Prepares data (raw samples or metering) to be passed to the spectrogram screen.
+
+3.  **`app/(tabs)/spectogramScreen.tsx` (Spectrogram Screen):**
+    *   Receives audio data (raw samples or metering) and initial options via navigation parameters.
+    *   Generates the spectrogram using the `generateSpectrogram` utility upon focusing or when critical options change.
+    *   Displays the spectrogram visually using `react-native-svg`.
+    *   Provides interactive controls (zoom, pan - implicitly via ScrollView, time selection, dynamic range, color map, FFT settings).
+    *   Displays time-domain and frequency-domain plots (full recording and selected time slice).
+    *   Handles exporting spectrogram metadata.
+
+4.  **`utils/spectogram.ts`:**
+    *   Contains the core logic for generating the spectrogram data (`generateSpectrogram`).
+    *   Includes functions for windowing (`createWindow`), calculating FFT parameters, and processing overlapping segments.
+    *   Defines options (`SpectrogramOptions`), window types (`WindowType`), and color maps (`ColorMapType`).
+
+5.  **`utils/fft.ts`:**
+    *   Provides the Fast Fourier Transform (FFT) implementation used by `spectogram.ts` and potentially by `spectogramScreen.tsx` for time-slice/full-spectrum analysis.
+
+6.  **`utils/wav_parser.js`:**
+    *   `extractRawPCMFromWAV`: Parses raw PCM audio samples (`Float32Array`) from WAV file data (provided as base64). Handles various WAV formats (bit depths, channels).
+    *   `extractRawPCMFromCompressed`: Uses `ffmpeg-kit-react-native` to convert compressed audio formats (MP3, M4A, etc.) into a temporary WAV file, then uses `extractRawPCMFromWAV` to get the PCM data.
+
+7.  **`utils/ffmpeg.ts`:**
+    *   Helper utility (`ensureFFmpegLoaded`) to manage loading the FFmpeg library, potentially handling platform differences or loading states.
+
+## Workflow Details:
+
+### 1. Recording Audio
+
+1.  **User Interaction:** User presses the "Record" button on the main screen (`index.tsx`).
+2.  **Permissions:** `startRecording` function requests `RECORD_AUDIO` permission (Android).
+3.  **Initialization:** `AudioRecord.init` is called with desired sample rate, channels, bit depth. The `accumulatedBuffers` ref is cleared.
+4.  **Data Listener:** `AudioRecord.on('data', callback)` sets up a listener. The callback receives audio chunks as base64 strings.
+5.  **Chunk Processing:** Inside the callback, the base64 chunk is decoded into a `Buffer` and pushed into the `accumulatedBuffers.current` array.
+6.  **Start Recording:** `AudioRecord.start()` begins the native recording process. `isRecording` state is set to `true`.
+7.  **User Stops:** User presses the "Stop" button.
+8.  **Stop Native:** `stopRecording` function calls `await AudioRecord.stop()`.
+9.  **Concatenation:** All `Buffer` objects in `accumulatedBuffers.current` are concatenated into a single `finalBuffer`. The ref is cleared.
+10. **PCM Conversion:**
+    *   The `finalBuffer` (containing raw PCM data) is read into an `Int16Array` (`int16Samples`), respecting little-endian format.
+    *   The `Int16Array` is normalized into a `Float32Array` (`float32Samples`) ranging from -1.0 to 1.0. This `float32Samples` array is stored as `rawSamples` for later analysis.
+11. **WAV Encoding:** The `int16Samples` are encoded into a complete WAV file format (including header) using the `encodeWav` helper function, resulting in a `Uint8Array` (`wavBuffer`).
+12. **Saving:**
+    *   The `wavBuffer` is converted to a base64 string.
+    *   `FileSystem.writeAsStringAsync` saves the base64 string to a `.wav` file in the app's document directory.
+13. **State Update:** A new `SoundRecording` object is created containing the file `uri`, calculated `duration`, and the `rawSamples` (`Float32Array`). This object is added to the `recordList` state, refreshing the UI.
+
+### 2. Importing Audio File
+
+1.  **User Interaction:** User presses the "Pick audio" button (`index.tsx`).
+2.  **Document Picker:** `DocumentPicker.getDocumentAsync({ type: 'audio/*', copyToCacheDirectory: true })` is called.
+3.  **File Selection:** User selects a file. The file is copied to the app's cache directory.
+4.  **URI & Type Check:** The `uri` of the cached file is obtained. The code checks if the file extension or MIME type indicates it's a WAV file (`isWavFile`).
+5.  **Get Duration:** `Audio.Sound.createAsync` is used briefly to load the sound and get its `durationMillis` from the status. The sound is unloaded immediately.
+6.  **WAV File Processing:**
+    *   If `isWavFile` is true:
+        *   The file content is read as a base64 string using `FileSystem.readAsStringAsync`.
+        *   `extractRawPCMFromWAV(base64Data)` from `wav_parser.js` is called.
+        *   This function parses the header, finds the data chunk, reads samples according to `bitsPerSample` and `numChannels`, normalizes them to `Float32Array`, performs mono conversion if necessary, and returns a `PCMDataResult` object containing `samples` (`Float32Array`), `sampleRate`, `duration`, etc.
+        *   A new `SoundRecording` object is created with the file `uri`, duration, and the extracted `rawSamples`.
+        *   This object is added to the `recordList` state.
+7.  **Compressed File Processing:**
+    *   If `isWavFile` is false:
+        *   A placeholder `SoundRecording` object with the `uri`, estimated duration, and `isConverting: true` is immediately added to the `recordList` state (provides instant UI feedback).
+        *   `extractRawPCMFromCompressed(uri)` from `wav_parser.js` is called **asynchronously**.
+            *   This function constructs an FFmpeg command (`ffmpeg-kit-react-native`) to convert the input file (`uri`) to a temporary mono, 16-bit, 44.1kHz WAV file (`outputWavUri`) in the cache directory.
+            *   `FFmpegKit.execute` runs the command.
+            *   If successful, the temporary WAV file is read as base64.
+            *   `extractRawPCMFromWAV` is called on the temporary WAV's base64 data.
+            *   The temporary WAV file is deleted (`FileSystem.deleteAsync`).
+            *   The extracted `PCMDataResult` is returned.
+        *   **State Update (Delayed):** Once `extractRawPCMFromCompressed` resolves, the `recordList` state is updated again. The specific item matching the `uri` has its `rawSamples` populated with the extracted `Float32Array` and `isConverting` set back to `false`.
+8.  **Cancellation/Error:** If the user cancels the picker or an error occurs during processing, an alert is shown, and the process stops.
+
+### 3. Generating Sine Wave
+
+1.  **User Interaction:** User presses the "Sine Wave" button (`index.tsx`).
+2.  **Generation:** `generateSineWave` function is called.
+    *   Calculates the required number of samples based on `duration` and `sampleRate`.
+    *   Creates a `Float32Array` (`floatSamples`) and populates it with sine wave values normalized between -1.0 and 1.0. This is stored as `rawSamples`.
+    *   Converts the `Float32Array` to an `Int16Array` (`int16Samples`), scaling values to the 16-bit range.
+    *   Encodes the `Int16Array` into a WAV buffer (`wavBuffer`) using `encodeWav`.
+    *   Saves the `wavBuffer` as a `.wav` file using `FileSystem.writeAsStringAsync` (converting to base64 first).
+3.  **State Update:** A new `SoundRecording` object is created with the file `uri`, the `rawSamples` (`Float32Array`), and the `exactFrequency`. This object is added to the `recordList` state.
+
+### 4. Viewing Spectrogram
+
+1.  **User Interaction:** User presses the spectrogram icon (bar chart) on a `RecordListItem`.
+2.  **Data Preparation (`RecordListItem.processAudio`):**
+    *   Checks if `rec.rawSamples` (the `Float32Array`) exists and has data.
+    *   **If `rawSamples` exist:**
+        *   The `Float32Array` is converted to a regular array (`Array.from`) and then stringified using `JSON.stringify`. This string is assigned to `paramsForScreen.rawSamples`.
+        *   `initialOptions` object is populated (e.g., calculating `duration` from sample length and sample rate, adding `sineWaveFrequency` if available).
+    *   **If `rawSamples` do NOT exist:**
+        *   The `rec.metering` array (simplified dB values) is stringified and assigned to `paramsForScreen.audioMetering`.
+        *   `initialOptions` object is populated (estimating `duration` from `rec.duration`, playback status, or metering length).
+    *   The `initialOptions` object is stringified.
+3.  **Navigation:** `router.push` is called to navigate to `/(tabs)/spectogramScreen`. The stringified `rawSamples` OR `audioMetering`, and the stringified `initialOptions` are passed as navigation parameters.
+4.  **Screen Load (`spectogramScreen.tsx`):**
+    *   The screen mounts or gains focus (`useIsFocused`).
+    *   `useLocalSearchParams` retrieves the stringified parameters (`rawSamplesString`, `audioMeteringString`, `initialOptions`).
+    *   Initializes `isFilterEnabled` state (typically to `false`).
+5.  **Spectrogram Generation (`useEffect`):**
+    *   The primary `useEffect` hook runs (dependencies include `uri`, `rawSamplesString`, `audioMeteringString`, some options, `isFocused`, `isFilterEnabled`, `filteredSamples`).
+    *   It checks if the screen is focused and if input data exists.
+    *   It checks if a `spectrogramResult` already exists or if it's currently `isLoading`. If so, it often skips generation.
+    *   **If generation proceeds:**
+        *   Sets `isLoading = true`.
+        *   Resets visual controls (color map, sliders) to defaults derived from `initialOptions`.
+        *   Parses `rawSamplesString` back into a `Float32Array` (`localRawSamples`) using `JSON.parse`.
+        *   A `useMemo` hook calculates `filteredSamples`:
+            *   If `isFilterEnabled` is true and `my_iir_filter_coeffs.json` provides coefficients, it applies `applyIIRFilter(localRawSamples, coefficients.b, coefficients.a)`.
+            *   Otherwise, `filteredSamples` will be `localRawSamples`.
+        *   Determines the `audioInputData` (preferring `filteredSamples`, then `localRawSamples`, falling back to parsed `audioMeteringString`).
+        *   Parses `initialOptions`.
+        *   Calls `generateSpectrogram(audioInputData, generationOptions)` from `utils/spectogram.ts` **asynchronously**.
+            *   `generateSpectrogram` slices the input data into overlapping frames based on `fftSize` and `overlap`.
+            *   Applies a window function (`createWindow`) to each frame.
+            *   Performs FFT (`utils/fft.ts`) on each windowed frame.
+            *   Calculates magnitude (and potentially converts to dB based on `scaleType`, although UI focuses on dB).
+            *   Applies window gain correction.
+            *   Constructs the `spectrogram` (2D array of magnitudes), `frequencies` array, and `times` array.
+            *   Returns a `SpectrogramResult` object.
+        *   **State Update (Delayed):** When `generateSpectrogram` resolves:
+            *   The returned `SpectrogramResult` is stored in the `spectrogramResult` state.
+            *   `isLoading` is set to `false`.
+        *   If `generateSpectrogram` fails, an error is shown, `spectrogramResult` is set to `null`, and `isLoading` is set to `false`.
+6.  **Rendering:**
+    *   The component re-renders based on the `isLoading` and `spectrogramResult` states.
+    *   If `isLoading` is true, a loading indicator is shown.
+    *   If `spectrogramResult` is available:
+        *   The `renderRotatedSpectrogram` or the non-rotated SVG renderer uses the data (`spectrogram`, `frequencies`, `times`) from `spectrogramResult` (which was generated using `filteredSamples` if the filter was active).
+        *   It calculates downsampling factors (`finalTimeDownsample`, `finalFreqDownsample`) based on data size and `MAX_RECTANGLES` to limit the number of rendered SVG elements.
+        *   It maps frequency and time values to SVG coordinates.
+        *   It iterates through the (downsampled) time and frequency points, calculates average magnitude for the corresponding block in the original data, gets the color using `getColorMemoized` (which uses `getColorFromMagnitude` with the current `dynamicRange` and `colorMap`), and renders an SVG `<Rect>`.
+        *   Axes, ticks, and labels are rendered based on `frequencies`, `times`, and calculated tick values (`freqTicks`, `timeTicks`).
+        *   The `renderTimeDomain` plot uses `filteredSamples` (if filter active, else `rawSamples`) if available, otherwise reconstructs a rough signal from `spectrogramResult`. It normalizes and potentially downsamples the data before rendering as an SVG `<Path>`.
+        *   The `renderFullSpectrum` plot uses `memoizedFullSpectrumData`. This `useMemo` hook calculates the spectrum once based on `filteredSamples` (if filter active, else `rawSamples`) and relevant `options`. It performs a single large FFT on the (potentially downsampled) samples, filters by frequency range, downsamples the result for plotting efficiency (`pointsToPlot`), and renders as an SVG `<Path>`.
+7.  **Interaction:**
+    *   **Controls:** Changing sliders (Dynamic Range, Overlap) or buttons (Window Type, FFT Size, Color Map) updates the `options` or `colorMap` state. Changes to FFT Size, Overlap, or Window Type trigger the generation `useEffect` again. Changes to Dynamic Range or Color Map directly affect rendering via `getColorMemoized` without full regeneration.
+    *   **Filter Toggle:** Pressing the "Filter: ON/OFF" button toggles the `isFilterEnabled` state and sets `spectrogramResult` to `null`. This forces the generation `useEffect` to re-run, recalculating the spectrogram using the new state of `filteredSamples`.
+    *   **Rotation:** Toggling the "Rotate" button changes the `isRotated` state, switching between the horizontal scroll view (non-rotated) and the vertical layout with time-slice plots (rotated).
+    *   **Time Selection (Rotated View):** Clicking (`TouchableWithoutFeedback`) on the rotated spectrogram calls `handleSpectrogramClick`.
+        *   Calculates the clicked time based on the Y coordinate.
+        *   Finds the `closestTimeIndex` in the `spectrogramResult.times` array.
+        *   Updates `selectedTimeIndex`, `selectedTime`, and `selectionRect` state (for the visual marker).
+        *   Calls `calculateTimeSliceSpectrum(timeIndex)`.
+            *   This function extracts the relevant segment from `filteredSamples` (if filter active, else `rawSamples`) based on `timeIndex` and `fftSize`.
+            *   Applies windowing and performs an FFT on that segment.
+            *   Updates the `spectrumData` state.
+        *   The `renderSpectrum` and `renderSegmentTimeDomain` components (visible only when rotated and a time is selected) re-render using the updated `spectrumData` or the extracted segment from `filteredSamples` (or `rawSamples`).
+8.  **Screen Blur (`useFocusEffect` Cleanup):** When the user navigates away from the screen, the cleanup function runs, setting `isLoading` to `false` and `spectrogramResult` (and other interaction states like `selectedTimeIndex`) to `null`. This ensures a fresh generation occurs when the user navigates back to the screen for the same or a different recording.
+
+### 5. Downloading Audio
+
+1.  **User Interaction:** User presses the download icon on a `RecordListItem`.
+2.  **Permission:** `downloadAudio` requests `MediaLibrary` permission.
+3.  **File Handling:**
+    *   Determines the source `uri` (can be `file://` or `data:audio/wav;base64,...`).
+    *   Generates a unique destination filename (e.g., `exported-1678886400000-sine-wave-1000Hz.wav`).
+    *   Determines the destination path in the cache directory (`FileSystem.cacheDirectory`).
+    *   If source is base64, uses `FileSystem.writeAsStringAsync` to write decoded data to the cache file.
+    *   If source is `file://`, uses `FileSystem.copyAsync` to copy the file to the cache destination.
+    *   (If source were remote, it would use `FileSystem.downloadAsync`).
+4.  **Media Library:** `MediaLibrary.createAssetAsync(destinationUri)` saves the file from the cache directory into the device's shared media storage (e.g., Music folder).
+5.  **Feedback:** An alert notifies the user of success or failure. `downloadingFile` state is reset.
+
+This covers the main flows within the application, showing how data is captured, processed, stored, passed between components, and ultimately visualized. 

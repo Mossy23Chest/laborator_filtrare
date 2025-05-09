@@ -10,6 +10,8 @@ import * as Sharing from 'expo-sharing';
 import { FFT, dbToLinear } from '../../utils/fft';
 import Animated, { useSharedValue, useAnimatedScrollHandler, useDerivedValue } from 'react-native-reanimated';
 import { AppStateContext } from './index';
+import { applyIIRFilter } from '../../utils/audioFilters';
+import myFilterCoefficients from '../../utils/filters/my_iir_filter_coeffs.json';
 
 /**
  * Represents the available color map options for the spectrogram.
@@ -241,6 +243,7 @@ const SpectrogramScreen: React.FC = () => {
   const [colorMap, setColorMap] = useState<ColorMap>('viridis'); // Currently selected color map preset for the spectrogram visualization.
   const [isRotated, setIsRotated] = useState(false); // Toggles between standard horizontal spectrogram and rotated vertical view.
   const [selectedTimeIndex, setSelectedTimeIndex] = useState<number | null>(null); // Index of the currently selected time frame (column in the spectrogram matrix).
+  const [isFilterEnabled, setIsFilterEnabled] = useState(false); // State to toggle IIR filter
 
   // State for the visual selection indicator (line/rectangle) on the spectrogram.
   // In rotated view, this is a horizontal line at the selected time.
@@ -301,11 +304,36 @@ const SpectrogramScreen: React.FC = () => {
     return null; // Return null if no string was provided or parsing failed.
   }, [rawSamplesString]); // Dependency: Only re-run if the input string changes.
 
+  // Apply the IIR filter to the raw samples
+  const filteredSamples = useMemo<Float32Array | null>(() => {
+    if (!rawSamples) {
+      return null; // No raw samples to process
+    }
+    // If the filter is enabled and filter coefficients are available,
+    // apply the IIR filter using the 'applyIIRFilter' utility function.
+    // The coefficients are imported from a JSON file (my_iir_filter_coeffs.json).
+    if (isFilterEnabled && myFilterCoefficients.b && myFilterCoefficients.a) {
+      console.log("Applying IIR filter to audio samples...");
+      const startTime = performance.now(); // Optional: for performance measurement
+      
+      const processedSamples = applyIIRFilter(rawSamples, myFilterCoefficients.b, myFilterCoefficients.a);
+      
+      const endTime = performance.now();
+      console.log(`IIR filtering took ${(endTime - startTime).toFixed(2)} ms for ${rawSamples.length} samples.`);
+      return processedSamples;
+    }
+    // If filter is not enabled or coefficients are missing, return raw samples
+    // This ensures that the 'filteredSamples' variable always holds valid audio data
+    // (either processed or original) for subsequent steps like spectrogram generation.
+    console.log("IIR Filter is OFF or coefficients missing, using raw samples.");
+    return rawSamples; 
+  }, [rawSamples, isFilterEnabled]);
+
   // --- Spectrogram Generation Effect ---
   // This effect handles triggering the `generateSpectrogram` utility function
   // when the screen becomes focused or relevant input props/options change.
   useEffect(() => {
-    console.log(`[Generation Effect] Running. Focused: ${isFocused}, URI: ${uri}, Result Exists: ${!!spectrogramResult}, IsLoading: ${isLoading}`);
+    console.log(`[Generation Effect] Running. Focused: ${isFocused}, URI: ${uri}, Result Exists: ${!!spectrogramResult}, IsLoading: ${isLoading}, Filter: ${isFilterEnabled}`);
 
     // --- Conditions to SKIP generation ---
     // 1. Screen not focused: Don't generate if the user isn't viewing the screen.
@@ -349,61 +377,50 @@ const SpectrogramScreen: React.FC = () => {
     }));
 
     // Prepare audio input data for the generator function.
-    let localRawSamples: Float32Array | null = null;
-    try {
-      if (rawSamplesString) {
-        localRawSamples = new Float32Array(JSON.parse(rawSamplesString));
-        console.log(`[Generation Effect] Parsed ${localRawSamples.length} raw samples from prop.`);
-      }
-    } catch (e) {
-      console.error("[Generation Effect] Error parsing rawSamplesString prop:", e);
-      Alert.alert("Error", "Failed to parse raw audio sample data.");
-      return;
-    }
-
-    // Prepare audio input data for the generator function.
-    let audioInputData: number[] | Float32Array | null = null;
+    let audioInputData: Float32Array | number[] | null = null;
     let estimatedDuration = 0;
+    const currentSamplingRate = options.samplingRate || 44100;
 
-    try {
-      // Prioritize using the high-fidelity raw samples if available.
-      if (localRawSamples) { // Use the memoized rawSamples directly
-        console.log("[Generation Effect] Using parsed raw samples as input.");
-        audioInputData = localRawSamples;
-        estimatedDuration = localRawSamples.length / (options.samplingRate || 44100);
-        // Fallback to lower-fidelity metering data if raw samples are not available.
-      } else if (audioMeteringString) {
-        console.log("[Generation Effect] Using audioMeteringString prop as input.");
+    if (isFilterEnabled && filteredSamples && filteredSamples.length > 0) {
+      console.log("[Generation Effect] Using FILTERED samples as input.");
+      audioInputData = filteredSamples;
+      estimatedDuration = filteredSamples.length / currentSamplingRate;
+    } else if (rawSamples && rawSamples.length > 0) { 
+      console.log("[Generation Effect] Filter OFF or filtered samples unavailable. Using RAW samples as input.");
+      audioInputData = rawSamples;
+      estimatedDuration = rawSamples.length / currentSamplingRate;
+    } else if (audioMeteringString) {
+      console.log("[Generation Effect] Using audioMeteringString prop as input.");
+      try {
         const parsedMetering = JSON.parse(audioMeteringString);
-        // Validate the parsed metering data structure.
         if (parsedMetering && Array.isArray(parsedMetering.spectrogram)) { // Old format check
           console.warn("[Generation Effect] Received old SpectrogramData structure - cannot generate.");
-          audioInputData = null;
           Alert.alert("Warning", "Cannot regenerate spectrogram from this old data format.");
         } else if (Array.isArray(parsedMetering)) {
-          // Assume it's a simple array of numbers (dB values).
-          audioInputData = parsedMetering;
-          const initialDuration = options.duration;
-          // Use duration passed in options, or estimate from metering length (very rough).
-          estimatedDuration = initialDuration || (parsedMetering.length / 60);  // Assume 60Hz metering rate
+          audioInputData = parsedMetering.map((val: any) => 
+            (typeof val !== 'number' || isNaN(val) || val === -Infinity) ? -160 : Math.max(-160, Math.min(0, val))
+          );
+          estimatedDuration = options.duration || (parsedMetering.length / 60);  // Use existing options.duration or estimate
         } else {
           throw new Error("Invalid audioMeteringString format");
         }
-      } else {
-        // This case should ideally not be reached due to earlier checks, but included for safety.
-        throw new Error("No valid audio input prop available after parsing.");
+  } catch (error) {
+        console.error('[Generation Effect] Error parsing audioMeteringString:', error);
+        Alert.alert('Error', 'Could not parse audio metering data.');
+        setIsLoading(false); // Stop loading if parsing fails
+        return;
       }
-    } catch (error) {
-      console.error('[Generation Effect] Error preparing audio input data:', error);
-      Alert.alert('Error', 'Could not prepare audio data.');
-      // Stop the generation process.
+    } else {
+      console.warn('[Generation Effect] No audio input props available after attempting all sources.');
+      if (spectrogramResult) setSpectrogramResult(null);
+      setIsLoading(false); // Stop loading if no input
       return;
     }
 
     // Final check if audio data preparation failed.
-    if (!audioInputData) {
-      console.error("[Generation Effect] Failed to prepare audio input data for generator.");
-      // Stop the generation process.
+    if (!audioInputData || audioInputData.length === 0) {
+      console.error("[Generation Effect] Failed to prepare audio input data for generator or data is empty.");
+      setIsLoading(false); // Stop loading if data prep fails
       return;
     }
 
@@ -411,11 +428,14 @@ const SpectrogramScreen: React.FC = () => {
     console.log("[Generation Effect] Setting loading state.");
     setIsLoading(true);
 
-    // Create a copy of options to pass to the generator function.
-    const generationOptions = { ...options };
+    // Create a copy of options to pass to the generator function, ensuring duration is updated.
+    const generationOptions = { 
+      ...options,
+      duration: estimatedDuration // Pass the accurately calculated duration
+    };
     const inputDataForGenerator = audioInputData; // Use the prepared data
 
-    console.log("[Generation Effect] Starting generateSpectrogram call...");
+    console.log("[Generation Effect] Starting generateSpectrogram call with duration:", estimatedDuration);
     generateSpectrogram(inputDataForGenerator, generationOptions)
       .then((result: SpectrogramResult) => {
         // --- Success ---
@@ -443,12 +463,18 @@ const SpectrogramScreen: React.FC = () => {
     // - The `spectrogramResult` or `isLoading` state changes (used to prevent re-runs while loading or if result exists).
   }, [
     uri,
-    rawSamplesString,
-    audioMeteringString,
+    rawSamples, // Using the parsed rawSamples directly
+    filteredSamples, // Added dependency
+    isFilterEnabled, // Added dependency
+    audioMeteringString, // Still needed as a fallback
     options.fftSize,
     options.overlap,
     options.windowType,
-    options.samplingRate,
+    options.samplingRate, // Keep options.samplingRate as options.duration depends on it here
+    // options.duration is now calculated inside, so it should not be a direct dependency if it causes loops.
+    // However, if user can change options.duration via controls and expect re-gen, it might be needed.
+    // For now, relying on options object changes or specific sub-properties that influence generation.
+    // Let's keep the existing specific option dependencies and add the new sample ones.
     spectrogramResult,  // Re-run if result becomes null (e.g., after blurring)
     isLoading,  // Re-run if loading finishes
     isFocused // Re-run when focus changes
@@ -696,22 +722,22 @@ const SpectrogramScreen: React.FC = () => {
     let samplesForSegment: Float32Array;
 
     // --- Extract Audio Segment ---
-    // 1. Prioritize using raw PCM samples for highest accuracy.
-    if (rawSamples) {
-      console.log("Using raw samples for time slice spectrum");
+    // 1. Prioritize using filtered PCM samples for highest accuracy.
+    if (filteredSamples) {
+      console.log("Using filtered samples for time slice spectrum");
       // Estimate the number of audio samples corresponding to one time frame in the spectrogram.
       // This depends on the original audio length and the number of time frames generated.
-      const samplesPerTimeFrame = (currentTimes && currentTimes.length > 0 && rawSamples) ? Math.floor(rawSamples.length / currentTimes.length) : (currentOptions.samplingRate || 44100) * 0.01; // Fallback to 10ms worth of samples
+      const samplesPerTimeFrame = (currentTimes && currentTimes.length > 0 && filteredSamples) ? Math.floor(filteredSamples.length / currentTimes.length) : (currentOptions.samplingRate || 44100) * 0.01; // Fallback to 10ms worth of samples
       // Calculate the starting sample index in the raw audio array.
       const startSampleIndex = timeIndex * samplesPerTimeFrame;
       // Define the length of the segment to analyze (typically the FFT size).
       const segmentLength = currentOptions.fftSize || 1024;
       // Calculate the ending sample index, clamping to the array bounds.
-      const endSampleIndex = rawSamples ? Math.min(startSampleIndex + segmentLength, rawSamples.length) : startSampleIndex + segmentLength;
+      const endSampleIndex = filteredSamples ? Math.min(startSampleIndex + segmentLength, filteredSamples.length) : startSampleIndex + segmentLength;
 
       // Extract the slice of raw samples.
-      samplesForSegment = rawSamples ? rawSamples.slice(startSampleIndex, endSampleIndex) : new Float32Array();
-      console.log(`Extracted ${samplesForSegment.length} raw samples from index ${startSampleIndex} to ${endSampleIndex}`);
+      samplesForSegment = filteredSamples ? filteredSamples.slice(startSampleIndex, endSampleIndex) : new Float32Array();
+      console.log(`Extracted ${samplesForSegment.length} filtered samples from index ${startSampleIndex} to ${endSampleIndex}`);
 
     } else {
       // 2. Fallback: Reconstruct an approximate signal from spectrogram data (less accurate).
@@ -801,7 +827,7 @@ const SpectrogramScreen: React.FC = () => {
       frequencies: frequencies, // Corresponding frequencies
       maxFreq: f_max  // Max frequency represented
     });
-  }, [rawSamples, currentOptions, spectrogramResult]); // Dependencies
+  }, [filteredSamples, currentOptions, spectrogramResult, currentTimes]); // Dependencies, added filteredSamples and currentTimes
 
   /**
   * Memoized calculation of the frequency spectrum for the *entire* recording.
@@ -817,11 +843,11 @@ const SpectrogramScreen: React.FC = () => {
     // --- Input Data Preparation ---
     // Requires raw samples to perform the calculation.
     let samplesForFFTInput: Float32Array | null = null;
-    if (rawSamples && rawSamples.length > 0) {
-      samplesForFFTInput = rawSamples;
+    if (filteredSamples && filteredSamples.length > 0) {
+      samplesForFFTInput = filteredSamples;
     } else {
-      console.error("[useMemo FullSpectrum] Raw samples not available.");
-      return null; // Cannot calculate without raw samples
+      console.error("[useMemo FullSpectrum] Filtered samples not available or empty.");
+      return null; // Cannot calculate without samples
     }
 
     const N_original = samplesForFFTInput.length; // Original number of samples
@@ -963,7 +989,7 @@ const SpectrogramScreen: React.FC = () => {
     // Return the full spectrum, frequencies, and the downsampled points for plotting.
     return { spectrum: finalSpectrum, frequencies, pointsToPlot };
 
-  }, [rawSamples, currentOptions.samplingRate, currentOptions.windowType, currentOptions.minFreq, currentOptions.maxFreq]);
+  }, [filteredSamples, currentOptions.samplingRate, currentOptions.windowType, currentOptions.minFreq, currentOptions.maxFreq]);
 
 
   /**
@@ -1082,17 +1108,17 @@ const SpectrogramScreen: React.FC = () => {
    * @returns A React Native View containing the SVG plot or null.
    */
   const renderSegmentTimeDomain = () => {
-    if (!rawSamples || selectedTimeIndex === null || selectedTimeIndex < 0 || !currentTimes || selectedTimeIndex >= currentTimes.length) {
+    if (!filteredSamples || selectedTimeIndex === null || selectedTimeIndex < 0 || !currentTimes || selectedTimeIndex >= currentTimes.length) {
       return null; // Cannot render without raw samples or a valid selection
     }
 
     // --- Extract Sample Segment ---
     // (This logic mirrors the start of `calculateTimeSliceSpectrum`)
-    const samplesPerTimeFrame = Math.floor((rawSamples.length / currentTimes.length));
+    const samplesPerTimeFrame = Math.floor((filteredSamples.length / currentTimes.length));
     const startSampleIndex = selectedTimeIndex * samplesPerTimeFrame;
     const segmentLength = currentOptions.fftSize || 1024; // Use FFT size as the length of the segment to display
-    const endSampleIndex = Math.min(startSampleIndex + segmentLength, rawSamples.length);
-    const samplesForSegment = rawSamples.slice(startSampleIndex, endSampleIndex);
+    const endSampleIndex = Math.min(startSampleIndex + segmentLength, filteredSamples.length);
+    const samplesForSegment = filteredSamples.slice(startSampleIndex, endSampleIndex);
 
     if (samplesForSegment.length === 0) {
       console.error("No samples found for selected segment time domain plot.");
@@ -1353,33 +1379,33 @@ const SpectrogramScreen: React.FC = () => {
   const renderTimeDomain = useMemo(() => {
     // Show loading/unavailable text if data isn't ready.
     if (isLoading) return <Text style={styles.plotTitle}>Time Domain Signal (Loading...)</Text>;
-    if (!rawSamples && !spectrogramResult) return <Text style={styles.plotTitle}>Time Domain Signal (Unavailable)</Text>;
+    if (!filteredSamples && !spectrogramResult) return <Text style={styles.plotTitle}>Time Domain Signal (Unavailable)</Text>;
 
     let signalToPlot: number[]; // Array of normalized samples [-1, 1] for plotting
     let timeDuration: number; // Total duration of the signal in seconds
 
     // --- Prepare Signal Data ---
-    // 1. Use raw samples if available (preferred)
-    if (rawSamples) {
-      console.log("Rendering Time Domain from raw samples");
+    // 1. Use filtered samples if available (preferred)
+    if (filteredSamples) {
+      console.log("Rendering Time Domain from filtered samples");
       // --- Optional Downsampling for large rawSamples ---
       const MAX_TIME_POINTS = 8000; // Limit points rendered for performance
-      let effectiveSamples = rawSamples;
-      if (rawSamples.length > MAX_TIME_POINTS) {
-        const factor = Math.ceil(rawSamples.length / MAX_TIME_POINTS);
+      let effectiveSamples = filteredSamples;
+      if (filteredSamples.length > MAX_TIME_POINTS) {
+        const factor = Math.ceil(filteredSamples.length / MAX_TIME_POINTS);
         console.log(`Downsampling time domain plot by factor ${factor}`);
         // Downsample using max-absolute-value approach (similar to full spectrum input downsampling)
-        effectiveSamples = new Float32Array(Math.ceil(rawSamples.length / factor));
+        effectiveSamples = new Float32Array(Math.ceil(filteredSamples.length / factor));
         for (let i = 0; i < effectiveSamples.length; i++) {
           let maxAbs = 0;
           for (let j = 0; j < factor; j++) {
             const idx = i * factor + j;
-            if (idx < rawSamples.length) {
-              maxAbs = Math.max(maxAbs, Math.abs(rawSamples[idx]));
+            if (idx < filteredSamples.length) {
+              maxAbs = Math.max(maxAbs, Math.abs(filteredSamples[idx]));
             }
           }
           // Keep the sign of the first sample in the block for the maxAbs value
-          const sign = (i * factor < rawSamples.length) ? Math.sign(rawSamples[i * factor]) : 1;
+          const sign = (i * factor < filteredSamples.length) ? Math.sign(filteredSamples[i * factor]) : 1;
           effectiveSamples[i] = maxAbs * sign;
         }
         console.log(`Downsampled time domain to ${effectiveSamples.length} points`);
@@ -1389,7 +1415,7 @@ const SpectrogramScreen: React.FC = () => {
       const maxAbs = effectiveSamples.length > 0 ? Math.max(...effectiveSamples.map(Math.abs)) : 0;
       signalToPlot = Array.from(effectiveSamples).map(sample => maxAbs === 0 ? 0 : sample / maxAbs);
       // Calculate duration based on the *original* number of samples and sample rate.
-      timeDuration = rawSamples.length / (currentOptions.samplingRate || 44100); 
+      timeDuration = filteredSamples.length / (currentOptions.samplingRate || 44100); 
     }
     // 2. Fallback: Reconstruct from spectrogram data (less accurate) 
     else if (spectrogramResult) { // Explicitly check spectrogramResult isn't null
@@ -1467,7 +1493,7 @@ const SpectrogramScreen: React.FC = () => {
         </Svg>
       </View>
     );
-  }, [isLoading, rawSamples, spectrogramResult, currentOptions.samplingRate]); // Added dependencies for useMemo
+  }, [isLoading, filteredSamples, spectrogramResult, currentOptions.samplingRate]); // Added dependencies for useMemo
 
   /**
    * Renders the frequency spectrum plot for the *entire* recording (non-rotated view).
@@ -1899,6 +1925,22 @@ const SpectrogramScreen: React.FC = () => {
           <View style={styles.headerButtons}>
             {/* Rotate Button: Toggles between horizontal and vertical spectrogram */}
             <Button title="Rotate" onPress={() => setIsRotated(!isRotated)} disabled={isLoading} />
+            {/* Filter Toggle Button */}
+            <Button 
+              title={isFilterEnabled ? "Filter: ON" : "Filter: OFF"}
+              onPress={() => {
+                // Toggles the 'isFilterEnabled' state.
+                setIsFilterEnabled(!isFilterEnabled);
+                // Add this line to clear the existing result, forcing regeneration
+                // When the filter state changes, the spectrogram result is cleared.
+                // This ensures that the spectrogram generation effect (useEffect)
+                // re-runs and uses the new 'filteredSamples' (or raw samples if filter is off),
+                // thus updating the displayed spectrogram.
+                setSpectrogramResult(null);
+              }}
+              disabled={isLoading}
+              color={isFilterEnabled ? '#4CAF50' : '#f44336'} // Green when ON, Red when OFF
+            />
             {/* Show/Hide Controls Button */}
             <Button title={showControls ? "Hide Controls" : "Show Controls"} onPress={() => setShowControls(!showControls)} disabled={isLoading} />
             {/* Export Data Button */}
